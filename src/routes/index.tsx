@@ -107,7 +107,7 @@ function Gallery() {
     if (!items || to < 0 || to >= items.length || from === to) return;
     const l = [...items];
     const [x] = l.splice(from, 1);
-    l.splice(to, 0, x);
+    l.splice(to, 0, x!);
     setItems(l);
     if (persist) void persistOrder(l);
   };

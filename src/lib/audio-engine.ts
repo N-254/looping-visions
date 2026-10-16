@@ -44,10 +44,10 @@ class Engine {
   private token = 0;
   private voices = new Set<Voice>();
   private nextStart = 0;
-  private buffer?: AudioBuffer;
+  private buffer: AudioBuffer | undefined;
   private timer?: ReturnType<typeof setTimeout>;
   private els: { el: HTMLAudioElement; node: MediaElementAudioSourceNode; g: GainNode }[] = [];
-  private elUrl?: string;
+  private elUrl: string | undefined;
   private active = 0;
   private fading = false;
 
@@ -77,7 +77,7 @@ class Engine {
       this.out.addEventListener("pause", () => {
         if (this.state.status === "playing") this.pause();
       });
-    } else this.master.connect(ctx.destination);
+    } else this.master.connect((ctx as AudioContext).destination);
     this.ctx = ctx;
     return ctx;
   }
@@ -186,7 +186,7 @@ class Engine {
       el.onended = () => this.swap(true);
       this.els.push({ el, node, g });
     }
-    const first = this.els[0].el;
+    const first = this.els[0]!.el;
     await new Promise<void>((res, rej) => {
       first.oncanplay = () => res();
       first.onerror = () => rej(new Error("decode"));
@@ -237,7 +237,7 @@ class Engine {
     if (!this.ctx || this.state.status !== "paused") return;
     await this.ctx.resume();
     await this.out?.play().catch(() => {});
-    if (this.els.length) await this.els[this.active].el.play().catch(() => {});
+    if (this.els.length) await this.els[this.active]!.el.play().catch(() => {});
     this.set({ status: this.ctx.state === "running" ? "playing" : "paused" });
   }
 
