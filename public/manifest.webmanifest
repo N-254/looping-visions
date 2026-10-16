@@ -1,0 +1,11 @@
+{
+  "name": "Dreamer",
+  "short_name": "Dreamer",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#1c1b19",
+  "theme_color": "#1c1b19",
+  "icons": [
+    { "src": "/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any maskable" }
+  ]
+}
