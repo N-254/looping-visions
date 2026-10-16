@@ -11,5 +11,6 @@
 
 ## Architecture
 - Dreamer is local-only: all items and media live in IndexedDB (src/lib/db.ts); no backend — the spec forbids accounts/cloud sync.
-- All local audio goes through the single `engine` in src/lib/audio-engine.ts (scheduled Web Audio crossfades, routed to an <audio> element for Media Session/background); never create other players.
+- All local audio goes through the single `engine` in src/lib/audio-engine.ts: memory-bounded files use a once-rendered overlapping crossfade buffer with native looping; long files use two streamed gain-routed voices. Output uses one MediaStream audio element for Media Session; this avoids periodic buffer scheduling and competing sessions.
+- Player dismissal uses pointer gestures isolated from controls plus an accessible close control; unmount stops the local engine so interrupted dismissal cannot leave audio behind.
 - YouTube sources use only the official IFrame player, kept visible in the player screen — never extract or proxy audio.
