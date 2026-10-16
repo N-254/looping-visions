@@ -1,5 +1,7 @@
 import { useEffect, useRef, useState } from "react";
-import { ChevronLeft, Loader2, Pause, Play } from "lucide-react";
+import { X, Loader2, Pause, Play } from "lucide-react";
+import { Button } from "@/components/ui/button";
+import { isDismissSwipe, type SwipePoint } from "@/lib/player-gesture";
 import type { Item } from "@/lib/db";
 import { engine, type EngineState } from "@/lib/audio-engine";
 import { loadYouTubeApi, type YTPlayer } from "@/lib/youtube";
@@ -35,7 +37,21 @@ export function Player({ item, onClose }: { item: Item; onClose: () => void }) {
   const [ui, setUi] = useState<UI>({ status: "loading" });
   const ytHost = useRef<HTMLDivElement>(null);
   const yt = useRef<YTPlayer | null>(null);
+  const dialog = useRef<HTMLDivElement>(null);
+  const gesture = useRef<(SwipePoint & { id: number }) | null>(null);
   const isYt = item.source.type === "youtube";
+
+  useEffect(() => {
+    const previous = document.activeElement;
+    dialog.current?.focus();
+    const overflow = document.body.style.overflow;
+    document.body.style.overflow = "hidden";
+    return () => {
+      document.body.style.overflow = overflow;
+      if (!isYt) engine.stop();
+      if (previous instanceof HTMLElement) previous.focus();
+    };
+  }, [isYt]);
 
   useEffect(() => {
     const u = URL.createObjectURL(item.cover);
@@ -77,12 +93,12 @@ export function Player({ item, onClose }: { item: Item; onClose: () => void }) {
               else if (e.data === S.PAUSED || e.data === S.CUED) setUi({ status: "paused" });
               else if (e.data === S.BUFFERING) setUi({ status: "loading" });
             },
-            onError: () => setUi({ status: "error", error: "Video unavailable or can't be embedded." }),
+            onError: () => { if (!dead) setUi({ status: "error", error: "Video unavailable or can't be embedded." }); },
           },
         });
         setUi({ status: "paused" });
       })
-      .catch((e: Error) => setUi({ status: "error", error: e.message }));
+      .catch((e: Error) => { if (!dead) setUi({ status: "error", error: e.message }); });
     return () => {
       dead = true;
       yt.current?.destroy();
@@ -93,7 +109,9 @@ export function Player({ item, onClose }: { item: Item; onClose: () => void }) {
   const play = () => (isYt ? yt.current?.playVideo() : void engine.resume());
   const pause = () => (isYt ? yt.current?.pauseVideo() : void engine.pause());
   const close = () => {
-    if (!isYt) engine.stop();
+    gesture.current = null;
+    if (isYt) yt.current?.pauseVideo();
+    else engine.stop();
     onClose();
   };
   const toggle = () => {
@@ -112,8 +130,19 @@ export function Player({ item, onClose }: { item: Item; onClose: () => void }) {
     const k = (e: KeyboardEvent) => {
       if (e.key === "Escape") close();
       if (e.key === " ") {
+        if (e.target instanceof Element && e.target.closest("button, input, select, textarea, iframe")) return;
         e.preventDefault();
         toggle();
+      }
+      if (e.key === "Tab" && dialog.current) {
+        const controls = [...dialog.current.querySelectorAll<HTMLElement>("button:not(:disabled), iframe")];
+        const first = controls[0];
+        const last = controls[controls.length - 1];
+        if (e.shiftKey && (document.activeElement === first || document.activeElement === dialog.current)) {
+          e.preventDefault(); last?.focus();
+        } else if (!e.shiftKey && document.activeElement === last) {
+          e.preventDefault(); first?.focus();
+        }
       }
     };
     window.addEventListener("keydown", k);
@@ -123,24 +152,42 @@ export function Player({ item, onClose }: { item: Item; onClose: () => void }) {
   const Icon = ui.status === "loading" ? Loader2 : ui.status === "playing" ? Pause : Play;
 
   return (
-    <div className="fixed inset-0 z-30 bg-background" role="dialog" aria-modal="true" aria-label={item.title}>
+    <div
+      ref={dialog}
+      tabIndex={-1}
+      className="fixed inset-0 z-30 touch-pinch-zoom bg-background outline-none"
+      role="dialog" aria-modal="true" aria-label={item.title}
+      onPointerDown={(e) => {
+        if (!e.isPrimary || e.button !== 0 || (e.target instanceof Element && e.target.closest("button, iframe, [data-player-control]"))) return;
+        gesture.current = { id: e.pointerId, x: e.clientX, y: e.clientY, time: e.timeStamp };
+        e.currentTarget.setPointerCapture?.(e.pointerId);
+      }}
+      onPointerUp={(e) => {
+        const start = gesture.current;
+        gesture.current = null;
+        if (start?.id === e.pointerId && isDismissSwipe(start, { x: e.clientX, y: e.clientY, time: e.timeStamp })) close();
+      }}
+      onPointerCancel={() => { gesture.current = null; }}
+      onLostPointerCapture={() => { gesture.current = null; }}
+    >
       {cover && <img src={cover} alt="" className="absolute inset-0 size-full object-cover" />}
       <div className="safe-top absolute inset-x-0 top-0 flex items-center gap-2 px-3">
-        <button className="glass-btn size-11" onClick={close} aria-label="Back">
-          <ChevronLeft className="size-6" />
-        </button>
+        <Button variant="ghost" size="icon" className="glass-btn size-11 [&_svg]:size-6" onClick={close} aria-label="Close player" title="Close player">
+          <X />
+        </Button>
         <h1 className="glass-btn truncate px-3 py-1.5 text-sm font-medium">{item.title}</h1>
       </div>
 
-      <div className="absolute inset-0 flex items-center justify-center">
-        <button
-          className="glass-btn size-20"
+      <div className="pointer-events-none absolute inset-0 flex items-center justify-center">
+        <Button
+          variant="ghost" size="icon"
+          className="glass-btn pointer-events-auto size-20 [&_svg]:size-9"
           onClick={toggle}
           aria-label={ui.status === "playing" ? "Pause" : "Play"}
           disabled={ui.status === "loading" && !isYt}
         >
           <Icon className={`size-9 ${ui.status === "loading" ? "animate-spin" : ""}`} />
-        </button>
+        </Button>
       </div>
 
       <div className="safe-bottom absolute inset-x-0 bottom-0 flex flex-col items-center gap-2 px-4">
@@ -150,7 +197,7 @@ export function Player({ item, onClose }: { item: Item; onClose: () => void }) {
           </p>
         )}
         {isYt && (
-          <div ref={ytHost} className="aspect-video w-56 overflow-hidden rounded-lg bg-scrim" />
+          <div ref={ytHost} data-player-control className="aspect-video w-56 touch-auto overflow-hidden rounded-lg bg-scrim" />
         )}
       </div>
     </div>

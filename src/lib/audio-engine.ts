@@ -1,55 +1,42 @@
-/**
- * Single shared looping engine for local audio files.
- * - Files <= MAX_DECODE bytes are decoded once into an AudioBuffer and looped by
- *   scheduling overlapping AudioBufferSourceNodes with equal-power crossfades.
- * - Larger files use two media elements routed through gain nodes (no full decode).
- * Output is routed to a MediaStream played by a hidden <audio> element so Chrome
- * treats it as real media (Media Session notification + background playback).
- */
+/** One local playback session: bounded native-loop buffers or two streamed voices. */
 export type Status = "idle" | "loading" | "playing" | "paused" | "error";
 export interface EngineState {
   status: Status;
   itemId: string | null;
   error?: string | undefined;
 }
-
-export const CROSSFADE = 3; // seconds (internal)
-const MAX_DECODE = 40 * 1024 * 1024;
-const LOOKAHEAD = 90; // seconds scheduled ahead, survives background timer throttling
-
+export const CROSSFADE = 3;
 export function crossfadeFor(duration: number) {
   return Math.max(0, Math.min(CROSSFADE, duration * 0.4));
 }
-
+// Account for encoded data plus two PCM buffers, conservatively up to 8 channels.
+export function canDecode(size: number, duration: number, sampleRate: number) {
+  return Number.isFinite(duration) && duration > 0 && size <= 16 * 1024 * 1024 &&
+    size + duration * sampleRate * 8 * 4 * 2 <= 64 * 1024 * 1024;
+}
 function curve(up: boolean) {
-  const n = 64;
-  const c = new Float32Array(n);
-  for (let i = 0; i < n; i++) {
-    const x = i / (n - 1);
-    c[i] = up ? Math.sin((x * Math.PI) / 2) : Math.cos((x * Math.PI) / 2);
-  }
-  return c;
+  return Float32Array.from({ length: 128 }, (_, i) =>
+    up ? Math.sin(i / 127 * Math.PI / 2) : Math.cos(i / 127 * Math.PI / 2));
 }
 const UP = curve(true);
 const DOWN = curve(false);
+type Voice = { el: HTMLAudioElement; node: MediaElementAudioSourceNode; g: GainNode };
 
-type Voice = { src: AudioBufferSourceNode; g: GainNode };
-
-class Engine {
+export class Engine {
   state: EngineState = { status: "idle", itemId: null };
   private listeners = new Set<(s: EngineState) => void>();
   private ctx?: AudioContext;
   private master?: GainNode;
   private out?: HTMLAudioElement;
   private token = 0;
-  private voices = new Set<Voice>();
-  private nextStart = 0;
-  private buffer: AudioBuffer | undefined;
-  private timer?: ReturnType<typeof setTimeout>;
-  private els: { el: HTMLAudioElement; node: MediaElementAudioSourceNode; g: GainNode }[] = [];
+  private source: AudioBufferSourceNode | undefined;
+  private timer: ReturnType<typeof setInterval> | undefined;
+  private els: Voice[] = [];
   private elUrl: string | undefined;
   private active = 0;
-  private fading = false;
+  private transition: { outgoing: Voice; end: number } | undefined;
+  private swapping = false;
+  private cancelLoad: (() => void) | undefined;
 
   subscribe(fn: (s: EngineState) => void) {
     this.listeners.add(fn);
@@ -59,11 +46,9 @@ class Engine {
   private set(s: Partial<EngineState>) {
     this.state = { ...this.state, ...s };
     this.listeners.forEach((l) => l(this.state));
-    if (navigator.mediaSession)
-      navigator.mediaSession.playbackState =
-        this.state.status === "playing" ? "playing" : this.state.status === "paused" ? "paused" : "none";
+    if (navigator.mediaSession) navigator.mediaSession.playbackState =
+      this.state.status === "playing" ? "playing" : this.state.status === "paused" ? "paused" : "none";
   }
-
   private ensure() {
     if (this.ctx) return this.ctx;
     const ctx = new AudioContext();
@@ -73,203 +58,202 @@ class Engine {
       this.master.connect(dest);
       this.out = new Audio();
       this.out.srcObject = dest.stream;
-      // OS / headset interruptions pause the element; mirror that as a real pause.
       this.out.addEventListener("pause", () => {
-        if (this.state.status === "playing") this.pause();
+        if (this.state.status === "playing") void this.pause();
       });
     } else this.master.connect((ctx as AudioContext).destination);
     this.ctx = ctx;
     return ctx;
   }
-
-  /** Must be called from a user gesture. */
+  /** Called from a user gesture; no playback starts in a React effect. */
   async start(itemId: string, blob: Blob) {
     const token = ++this.token;
-    this.teardown();
-    const ctx = this.ensure();
-    // Unlock inside the gesture, before any await.
-    void ctx.resume();
-    void this.out?.play().catch(() => {});
     this.set({ status: "loading", itemId, error: undefined });
+    this.teardown();
     try {
-      if (blob.size <= MAX_DECODE) {
-        const buf = await ctx.decodeAudioData(await blob.arrayBuffer());
+      const ctx = this.ensure();
+      // Unlock the output before awaiting metadata/decode.
+      void ctx.resume().catch(() => {});
+      void this.out?.play().catch(() => {});
+      this.elUrl = URL.createObjectURL(blob);
+      const first = this.createVoice(this.elUrl, 1);
+      await this.ready(first.el);
+      if (token !== this.token) return;
+      if (canDecode(blob.size, first.el.duration, ctx.sampleRate)) {
+        const buffer = await ctx.decodeAudioData(await blob.arrayBuffer());
         if (token !== this.token) return;
-        this.buffer = buf;
-        this.startBuffer();
+        const loop = await this.renderLoop(buffer);
+        if (token !== this.token) return;
+        this.releaseElements();
+        const source = ctx.createBufferSource();
+        source.buffer = loop;
+        source.loop = true;
+        source.connect(this.master ?? ctx.destination);
+        this.source = source;
+        source.start();
       } else {
-        await this.startElements(blob, token);
+        const second = this.createVoice(this.elUrl, 0);
+        await this.ready(second.el);
         if (token !== this.token) return;
+        if (!Number.isFinite(first.el.duration) || first.el.duration <= 0) throw new Error("duration");
+        await first.el.play();
+        if (token !== this.token) { first.el.pause(); return; }
+        this.timer = setInterval(() => this.tick(), 50);
       }
       await ctx.resume();
-      this.fadeMasterIn();
+      if (token !== this.token) return;
+      await this.out?.play();
+      if (token !== this.token) return;
+      const gain = this.master?.gain;
+      gain?.cancelScheduledValues(ctx.currentTime);
+      gain?.setValueAtTime(0, ctx.currentTime);
+      gain?.linearRampToValueAtTime(1, ctx.currentTime + 0.4);
       this.set({ status: ctx.state === "running" ? "playing" : "paused" });
     } catch {
       if (token !== this.token) return;
-      this.teardown();
       this.set({ status: "error", error: "This audio can't be played." });
+      this.teardown();
+      this.out?.pause();
+      void this.ctx?.suspend();
     }
   }
-
-  private fadeMasterIn() {
-    const ctx = this.ctx!;
-    const g = this.master!.gain;
-    g.cancelScheduledValues(ctx.currentTime);
-    g.setValueAtTime(0, ctx.currentTime);
-    g.linearRampToValueAtTime(1, ctx.currentTime + 0.4);
+  /** Render actual overlapping end/start voices once, then native-loop without JS timers. */
+  private async renderLoop(buffer: AudioBuffer) {
+    if (buffer.duration < 0.5) return buffer;
+    const overlap = crossfadeFor(buffer.duration);
+    const duration = buffer.duration - overlap;
+    const offline = new OfflineAudioContext(buffer.numberOfChannels,
+      Math.round(duration * buffer.sampleRate), buffer.sampleRate);
+    const outgoing = offline.createBufferSource();
+    outgoing.buffer = buffer;
+    const down = offline.createGain();
+    outgoing.connect(down).connect(offline.destination);
+    down.gain.setValueAtTime(1, 0);
+    down.gain.setValueCurveAtTime(DOWN, duration - overlap, overlap);
+    outgoing.start(0, overlap, duration);
+    const incoming = offline.createBufferSource();
+    incoming.buffer = buffer;
+    const up = offline.createGain();
+    incoming.connect(up).connect(offline.destination);
+    up.gain.setValueAtTime(0, 0);
+    up.gain.setValueCurveAtTime(UP, duration - overlap, overlap);
+    incoming.start(duration - overlap, 0, overlap);
+    return offline.startRendering();
   }
-
-  // ---- buffer mode ----
-  private startBuffer() {
-    const ctx = this.ctx!;
-    const buf = this.buffer!;
-    if (buf.duration < 0.5) {
-      // Too short to crossfade meaningfully: sample-accurate native loop.
-      const src = ctx.createBufferSource();
-      src.buffer = buf;
-      src.loop = true;
-      const g = ctx.createGain();
-      src.connect(g).connect(this.master!);
-      src.start();
-      this.voices.add({ src, g });
-      return;
-    }
-    this.nextStart = ctx.currentTime + 0.05;
-    this.scheduleVoice(false);
-    this.pump();
-  }
-
-  private scheduleVoice(fadeIn: boolean) {
-    const ctx = this.ctx!;
-    const buf = this.buffer!;
-    const D = buf.duration;
-    const X = crossfadeFor(D);
-    const start = this.nextStart;
-    const src = ctx.createBufferSource();
-    src.buffer = buf;
+  private createVoice(url: string, value: number) {
+    const ctx = this.ctx;
+    if (!ctx) throw new Error("context");
+    const el = new Audio();
+    el.preload = "auto";
+    const node = ctx.createMediaElementSource(el);
     const g = ctx.createGain();
-    src.connect(g).connect(this.master!);
-    if (fadeIn) {
-      g.gain.setValueAtTime(0, start);
-      g.gain.setValueCurveAtTime(UP, start, X);
-    } else g.gain.setValueAtTime(1, start);
-    g.gain.setValueCurveAtTime(DOWN, start + D - X, X);
-    src.start(start);
-    src.stop(start + D);
-    const v = { src, g };
-    this.voices.add(v);
-    src.onended = () => {
-      src.disconnect();
-      g.disconnect();
-      this.voices.delete(v);
-    };
-    this.nextStart = start + D - X;
+    g.gain.value = value;
+    node.connect(g).connect(this.master ?? ctx.destination);
+    const voice = { el, node, g };
+    this.els.push(voice);
+    el.src = url;
+    return voice;
   }
-
-  private pump = () => {
-    if (!this.ctx || !this.buffer) return;
-    while (this.nextStart < this.ctx.currentTime + LOOKAHEAD) this.scheduleVoice(true);
-    this.timer = setTimeout(this.pump, 20000);
-  };
-
-  // ---- element mode (large files) ----
-  private async startElements(blob: Blob, token: number) {
-    const ctx = this.ctx!;
-    this.elUrl = URL.createObjectURL(blob);
-    for (let i = 0; i < 2; i++) {
-      const el = new Audio(this.elUrl);
-      el.preload = "auto";
-      const node = ctx.createMediaElementSource(el);
-      const g = ctx.createGain();
-      g.gain.value = i === 0 ? 1 : 0;
-      node.connect(g).connect(this.master!);
-      el.onended = () => this.swap(true);
-      this.els.push({ el, node, g });
-    }
-    const first = this.els[0]!.el;
-    await new Promise<void>((res, rej) => {
-      first.oncanplay = () => res();
-      first.onerror = () => rej(new Error("decode"));
+  private ready(el: HTMLAudioElement) {
+    return new Promise<void>((resolve, reject) => {
+      const cleanup = () => {
+        el.removeEventListener("canplay", success);
+        el.removeEventListener("error", failure);
+        if (this.cancelLoad === cancel) this.cancelLoad = undefined;
+      };
+      const success = () => { cleanup(); resolve(); };
+      const failure = () => { cleanup(); reject(new Error("decode")); };
+      const cancel = () => { cleanup(); reject(new Error("cancelled")); };
+      this.cancelLoad = cancel;
+      el.addEventListener("canplay", success);
+      el.addEventListener("error", failure);
+      if (el.readyState >= 3) success();
+      else if (el.error) failure();
+      else el.load();
     });
-    if (token !== this.token) return;
-    this.active = 0;
-    await first.play();
-    this.timer = setInterval(() => {
-      const a = this.els[this.active]?.el;
-      if (!a || this.fading || !a.duration || a.paused) return;
-      if (a.currentTime >= a.duration - crossfadeFor(a.duration) - 0.15) this.swap(false);
-    }, 150) as unknown as ReturnType<typeof setTimeout>;
   }
-
-  private swap(immediate: boolean) {
-    if (this.fading && !immediate) return;
-    const ctx = this.ctx!;
+  private tick() {
+    const ctx = this.ctx;
+    if (!ctx || this.state.status !== "playing") return;
+    if (this.transition) {
+      if (ctx.currentTime < this.transition.end) return;
+      this.transition.outgoing.el.pause();
+      this.transition.outgoing.el.currentTime = 0;
+      this.transition = undefined;
+    }
+    const cur = this.els[this.active];
+    if (!cur || this.swapping) return;
+    if (cur.el.ended || cur.el.currentTime >= cur.el.duration - crossfadeFor(cur.el.duration))
+      void this.swap();
+  }
+  private async swap() {
+    const ctx = this.ctx;
     const cur = this.els[this.active];
     const nxt = this.els[1 - this.active];
-    if (!cur || !nxt) return;
-    const X = immediate ? 0.05 : crossfadeFor(cur.el.duration);
-    const t = ctx.currentTime;
-    this.fading = true;
-    nxt.el.currentTime = 0;
-    void nxt.el.play().catch(() => {});
-    nxt.g.gain.cancelScheduledValues(t);
-    nxt.g.gain.setValueAtTime(0, t);
-    nxt.g.gain.setValueCurveAtTime(UP, t, X);
-    cur.g.gain.cancelScheduledValues(t);
-    cur.g.gain.setValueAtTime(cur.g.gain.value, t);
-    cur.g.gain.setValueCurveAtTime(DOWN, t, X);
-    this.active = 1 - this.active;
-    setTimeout(() => {
-      cur.el.pause();
-      this.fading = false;
-    }, X * 1000 + 50);
+    if (!ctx || !cur || !nxt || this.swapping) return;
+    const token = this.token;
+    this.swapping = true;
+    try {
+      nxt.el.currentTime = 0;
+      await nxt.el.play();
+      if (token !== this.token) { nxt.el.pause(); return; }
+      const t = ctx.currentTime;
+      // Never run a fade longer than the actual outgoing audio still available.
+      const x = Math.max(0.01, Math.min(crossfadeFor(cur.el.duration), cur.el.duration - cur.el.currentTime));
+      nxt.g.gain.cancelScheduledValues(t);
+      nxt.g.gain.setValueAtTime(0, t);
+      nxt.g.gain.setValueCurveAtTime(UP, t, x);
+      cur.g.gain.cancelScheduledValues(t);
+      cur.g.gain.setValueAtTime(1, t);
+      cur.g.gain.setValueCurveAtTime(DOWN, t, x);
+      this.active = 1 - this.active;
+      this.transition = { outgoing: cur, end: t + x };
+      if (this.state.status !== "playing") nxt.el.pause();
+    } catch {
+      if (token === this.token) {
+        this.set({ status: "error", error: "Playback interrupted. Tap play to retry." });
+        this.teardown();
+        this.out?.pause();
+      }
+    } finally {
+      if (token === this.token) this.swapping = false;
+    }
   }
-
-  // ---- controls ----
   async pause() {
-    if (!this.ctx || this.state.status !== "playing") return;
-    this.els.forEach((e) => e.el.pause());
+    const ctx = this.ctx;
+    if (!ctx || this.state.status !== "playing") return;
     this.set({ status: "paused" });
-    await this.ctx.suspend();
+    this.els.forEach(({ el }) => el.pause());
+    this.out?.pause();
+    await ctx.suspend();
   }
-
   async resume() {
-    if (!this.ctx || this.state.status !== "paused") return;
-    await this.ctx.resume();
-    await this.out?.play().catch(() => {});
-    if (this.els.length) await this.els[this.active]!.el.play().catch(() => {});
-    this.set({ status: this.ctx.state === "running" ? "playing" : "paused" });
+    const ctx = this.ctx;
+    if (!ctx || this.state.status !== "paused") return;
+    const token = this.token;
+    try {
+      await ctx.resume();
+      if (token !== this.token) return;
+      await this.out?.play();
+      if (token !== this.token) return;
+      const voices = this.transition ? [this.els[this.active], this.transition.outgoing] : [this.els[this.active]];
+      await Promise.all(voices.map((v) => v?.el.play()));
+      if (token !== this.token) { voices.forEach((v) => v?.el.pause()); return; }
+      this.set({ status: ctx.state === "running" ? "playing" : "paused" });
+    } catch {
+      if (token === this.token) { this.set({ status: "playing" }); await this.pause(); }
+    }
   }
-
-  toggle() {
-    return this.state.status === "playing" ? this.pause() : this.resume();
-  }
-
+  toggle() { return this.state.status === "playing" ? this.pause() : this.resume(); }
   stop() {
-    this.token++;
+    ++this.token;
+    this.set({ status: "idle", itemId: null, error: undefined });
     this.teardown();
     this.out?.pause();
     void this.ctx?.suspend();
-    this.set({ status: "idle", itemId: null, error: undefined });
   }
-
-  private teardown() {
-    clearTimeout(this.timer);
-    clearInterval(this.timer);
-    this.voices.forEach((v) => {
-      v.src.onended = null;
-      try {
-        v.src.stop();
-      } catch {
-        /* not started */
-      }
-      v.src.disconnect();
-      v.g.disconnect();
-    });
-    this.voices.clear();
-    this.buffer = undefined;
+  private releaseElements() {
     this.els.forEach(({ el, node, g }) => {
-      el.onended = null;
       el.pause();
       el.removeAttribute("src");
       el.load();
@@ -277,15 +261,24 @@ class Engine {
       g.disconnect();
     });
     this.els = [];
-    this.fading = false;
     if (this.elUrl) URL.revokeObjectURL(this.elUrl);
     this.elUrl = undefined;
   }
-
-  /** For diagnostics/tests: number of live scheduled voices. */
-  get voiceCount() {
-    return this.voices.size;
+  private teardown() {
+    clearInterval(this.timer);
+    this.timer = undefined;
+    this.cancelLoad?.();
+    if (this.source) {
+      this.source.stop();
+      this.source.disconnect();
+      this.source.buffer = null;
+      this.source = undefined;
+    }
+    this.releaseElements();
+    this.transition = undefined;
+    this.swapping = false;
+    this.active = 0;
   }
+  get voiceCount() { return this.source ? 1 : this.els.filter(({ el }) => !el.paused).length; }
 }
-
 export const engine = typeof window === "undefined" ? (null as unknown as Engine) : new Engine();
