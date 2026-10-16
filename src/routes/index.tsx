@@ -116,7 +116,7 @@ function Gallery() {
     if (!dragId || !items) return;
     const el = document.elementFromPoint(e.clientX, e.clientY)?.closest<HTMLElement>("[data-idx]");
     if (!el) return;
-    const to = Number(el.dataset.idx);
+    const to = Number(el.dataset["idx"]);
     const from = items.findIndex((i) => i.id === dragId);
     move(from, to, false);
   };

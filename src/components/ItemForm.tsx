@@ -5,7 +5,7 @@ import { checkAudio, processImage } from "@/lib/media";
 import { parseYouTube } from "@/lib/youtube";
 
 interface Props {
-  initial?: Item;
+  initial?: Item | undefined;
   onCancel: () => void;
   onSave: (data: { title: string; cover: Blob; thumb: Blob; source: Source }) => Promise<void>;
 }
