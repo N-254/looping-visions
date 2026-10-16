@@ -29,14 +29,14 @@ export class Engine {
   private master?: GainNode;
   private out?: HTMLAudioElement;
   private token = 0;
-  private source?: AudioBufferSourceNode;
-  private timer?: ReturnType<typeof setInterval>;
+  private source: AudioBufferSourceNode | undefined;
+  private timer: ReturnType<typeof setInterval> | undefined;
   private els: Voice[] = [];
-  private elUrl?: string;
+  private elUrl: string | undefined;
   private active = 0;
-  private transition?: { outgoing: Voice; end: number };
+  private transition: { outgoing: Voice; end: number } | undefined;
   private swapping = false;
-  private cancelLoad?: () => void;
+  private cancelLoad: (() => void) | undefined;
 
   subscribe(fn: (s: EngineState) => void) {
     this.listeners.add(fn);
@@ -61,7 +61,7 @@ export class Engine {
       this.out.addEventListener("pause", () => {
         if (this.state.status === "playing") void this.pause();
       });
-    } else this.master.connect(ctx.destination);
+    } else this.master.connect((ctx as AudioContext).destination);
     this.ctx = ctx;
     return ctx;
   }
