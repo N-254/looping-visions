@@ -10,7 +10,7 @@ export type Status = "idle" | "loading" | "playing" | "paused" | "error";
 export interface EngineState {
   status: Status;
   itemId: string | null;
-  error?: string;
+  error?: string | undefined;
 }
 
 export const CROSSFADE = 3; // seconds (internal)

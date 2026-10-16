@@ -30,7 +30,7 @@ export interface YTPlayer {
 }
 declare global {
   interface Window {
-    YT?: { Player: new (el: HTMLElement, opts: unknown) => YTPlayer; PlayerState: Record<string, number> };
+    YT?: { Player: new (el: HTMLElement, opts: unknown) => YTPlayer; PlayerState: { ENDED: number; PLAYING: number; PAUSED: number; CUED: number; BUFFERING: number } };
     onYouTubeIframeAPIReady?: () => void;
   }
 }

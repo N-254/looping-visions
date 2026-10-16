@@ -4,7 +4,7 @@ import type { Item } from "@/lib/db";
 import { engine, type EngineState } from "@/lib/audio-engine";
 import { loadYouTubeApi, type YTPlayer } from "@/lib/youtube";
 
-type UI = { status: EngineState["status"]; error?: string };
+type UI = { status: EngineState["status"]; error?: string | undefined };
 
 function setSession(item: Item, cover: string, play: () => void, pause: () => void, stop: () => void) {
   const ms = navigator.mediaSession;
