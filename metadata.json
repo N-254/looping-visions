@@ -1,0 +1,7 @@
+{
+  "name": "Dreamer",
+  "description": "A personal gallery of images paired with looping sound.",
+  "requestFeedback": false,
+  "permissions": [],
+  "capabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

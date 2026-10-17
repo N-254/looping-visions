@@ -39,7 +39,11 @@ export function checkAudio(file: File): Promise<void> {
       a.removeAttribute("src");
       a.load();
       URL.revokeObjectURL(url);
-      err ? rej(new Error(err)) : res();
+      if (err) {
+        rej(new Error(err));
+      } else {
+        res();
+      }
     };
     const t = setTimeout(() => done("Audio can't be read."), 10000);
     a.preload = "metadata";

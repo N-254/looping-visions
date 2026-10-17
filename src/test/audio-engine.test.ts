@@ -1,31 +1,87 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { canDecode, Engine } from "@/lib/audio-engine";
+import { canDecode, crossfadeFor, Engine, CROSSFADE } from "@/lib/audio-engine";
 
 describe("bounded audio decoding", () => {
   it("decodes a safe short file", () => expect(canDecode(100000, 6, 48000)).toBe(true));
-  it("streams long compressed files despite small encoded size", () => expect(canDecode(1000000, 3600, 48000)).toBe(false));
+  it("streams long compressed files despite small encoded size", () =>
+    expect(canDecode(1000000, 3600, 48000)).toBe(false));
   it("streams large files", () => expect(canDecode(50 * 1024 * 1024, 120, 48000)).toBe(false));
 });
 
-const param = () => ({ value: 1, cancelScheduledValues: vi.fn(), setValueAtTime: vi.fn(), setValueCurveAtTime: vi.fn(), linearRampToValueAtTime: vi.fn() });
+describe("crossfade calculations", () => {
+  it("caps crossfade at CROSSFADE for long ambient tracks", () => {
+    expect(crossfadeFor(30)).toBe(CROSSFADE);
+    expect(crossfadeFor(120)).toBe(CROSSFADE);
+  });
+
+  it("scales crossfade down smoothly for short clips", () => {
+    expect(crossfadeFor(2)).toBeCloseTo(0.8);
+    expect(crossfadeFor(5)).toBe(2.0);
+  });
+
+  it("handles non-finite or zero duration gracefully", () => {
+    expect(crossfadeFor(0)).toBe(0);
+    expect(crossfadeFor(-5)).toBe(0);
+    expect(crossfadeFor(NaN)).toBe(0);
+  });
+});
+
+const param = () => ({
+  value: 1,
+  cancelScheduledValues: vi.fn(),
+  setValueAtTime: vi.fn(),
+  setValueCurveAtTime: vi.fn(),
+  linearRampToValueAtTime: vi.fn(),
+});
+
 class Context {
   state = "running";
   currentTime = 0;
   sampleRate = 48000;
   destination = {};
-  createGain() { return { gain: param(), connect: vi.fn().mockReturnThis(), disconnect: vi.fn() }; }
-  createMediaElementSource() { return { connect: vi.fn().mockReturnThis(), disconnect: vi.fn() }; }
-  resume = vi.fn(async () => { this.state = "running"; });
-  suspend = vi.fn(async () => { this.state = "suspended"; });
+  createGain() {
+    return { gain: param(), connect: vi.fn().mockReturnThis(), disconnect: vi.fn() };
+  }
+  createMediaElementSource() {
+    return { connect: vi.fn().mockReturnThis(), disconnect: vi.fn() };
+  }
+  createBufferSource() {
+    return {
+      buffer: null,
+      connect: vi.fn().mockReturnThis(),
+      disconnect: vi.fn(),
+      start: vi.fn(),
+      stop: vi.fn(),
+    };
+  }
+  decodeAudioData = vi.fn(async () => ({
+    duration: 10,
+    numberOfChannels: 2,
+    sampleRate: 48000,
+  }));
+  resume = vi.fn(async () => {
+    this.state = "running";
+  });
+  suspend = vi.fn(async () => {
+    this.state = "suspended";
+  });
 }
+
 afterEach(() => vi.unstubAllGlobals());
+
 describe("loading session cancellation", () => {
   it("stop cancels pending metadata and cannot restart zombie audio", async () => {
     vi.stubGlobal("AudioContext", Context);
     vi.stubGlobal("URL", { createObjectURL: vi.fn(() => "blob:test"), revokeObjectURL: vi.fn() });
     class Audio extends EventTarget {
-      src = ""; preload = ""; readyState = 0; error = null;
-      play = vi.fn(async () => {}); pause = vi.fn(); load = vi.fn(); removeAttribute = vi.fn();
+      src = "";
+      preload = "";
+      readyState = 0;
+      error = null;
+      play = vi.fn(async () => {});
+      pause = vi.fn();
+      load = vi.fn();
+      removeAttribute = vi.fn();
     }
     vi.stubGlobal("Audio", Audio);
     const engine = new Engine();
@@ -36,5 +92,52 @@ describe("loading session cancellation", () => {
     expect(engine.state).toEqual({ status: "idle", itemId: null, error: undefined });
     expect(engine.voiceCount).toBe(0);
     expect(URL.revokeObjectURL).toHaveBeenCalledWith("blob:test");
+  });
+});
+
+describe("playback lifecycle and state synchronization", () => {
+  it("resets state and position on stop()", () => {
+    vi.stubGlobal("AudioContext", Context);
+    const engine = new Engine();
+    engine.stop();
+    expect(engine.state.status).toBe("idle");
+    expect(engine.state.itemId).toBeNull();
+    expect(engine.position).toBe(0);
+  });
+
+  it("notifies subscribers when state changes", () => {
+    vi.stubGlobal("AudioContext", Context);
+    const engine = new Engine();
+    const states: string[] = [];
+    const unsubscribe = engine.subscribe((s) => states.push(s.status));
+    engine.stop();
+    unsubscribe();
+    expect(states).toContain("idle");
+  });
+
+  it("handles MediaSession metadata updates safely", () => {
+    const mockMediaSession = {
+      metadata: null,
+      playbackState: "none",
+      setActionHandler: vi.fn(),
+      setPositionState: vi.fn(),
+    };
+    vi.stubGlobal("navigator", { mediaSession: mockMediaSession });
+    vi.stubGlobal(
+      "MediaMetadata",
+      class {
+        title: string;
+        constructor(opts: { title: string }) {
+          this.title = opts.title;
+        }
+      },
+    );
+
+    const engine = new Engine();
+    engine.setMetadata({ title: "Rain on Window" });
+
+    expect(mockMediaSession.setActionHandler).toHaveBeenCalledWith("play", expect.any(Function));
+    expect(mockMediaSession.setActionHandler).toHaveBeenCalledWith("pause", expect.any(Function));
+    expect(mockMediaSession.setActionHandler).toHaveBeenCalledWith("stop", expect.any(Function));
   });
 });

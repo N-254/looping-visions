@@ -15,11 +15,13 @@ export function ItemForm({ initial, onCancel, onSave }: Props) {
   const [img, setImg] = useState<{ cover: Blob; thumb: Blob } | null>(
     initial ? { cover: initial.cover, thumb: initial.thumb } : null,
   );
-  const [kind, setKind] = useState<"file" | "youtube">(initial?.source.type ?? "file");
+  const [kind, setKind] = useState<"file" | "youtube">(initial?.source?.type ?? "file");
   const [audio, setAudio] = useState<{ blob: Blob; name: string } | null>(
-    initial?.source.type === "file" ? { blob: initial.source.blob, name: initial.source.name } : null,
+    initial?.source?.type === "file"
+      ? { blob: initial.source.blob, name: initial.source.name }
+      : null,
   );
-  const [url, setUrl] = useState(initial?.source.type === "youtube" ? initial.source.url : "");
+  const [url, setUrl] = useState(initial?.source?.type === "youtube" ? initial.source.url : "");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const [preview, setPreview] = useState<string>("");
@@ -158,7 +160,11 @@ export function ItemForm({ initial, onCancel, onSave }: Props) {
           className="w-full rounded-lg border border-input bg-transparent px-3 py-2.5 text-base outline-none focus:border-ring"
         />
 
-        <div role="radiogroup" aria-label="Audio source" className="flex gap-1 rounded-xl bg-muted p-1">
+        <div
+          role="radiogroup"
+          aria-label="Audio source"
+          className="flex gap-1 rounded-xl bg-muted p-1"
+        >
           {seg("file", FileAudio, "File")}
           {seg("youtube", Youtube, "YouTube")}
         </div>

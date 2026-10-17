@@ -17,5 +17,6 @@ describe("YouTube links", () => {
 
 describe("crossfade length", () => {
   it("uses the default for long clips", () => expect(crossfadeFor(120)).toBe(CROSSFADE));
-  it("shrinks for clips shorter than the crossfade", () => expect(crossfadeFor(2)).toBeCloseTo(0.8));
+  it("shrinks for clips shorter than the crossfade", () =>
+    expect(crossfadeFor(2)).toBeCloseTo(0.8));
 });

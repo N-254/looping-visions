@@ -1,6 +1,5 @@
 export type Source =
-  | { type: "file"; blob: Blob; name: string }
-  | { type: "youtube"; videoId: string; url: string };
+  { type: "file"; blob: Blob; name: string } | { type: "youtube"; videoId: string; url: string };
 
 export interface Item {
   id: string;
@@ -45,7 +44,47 @@ export async function getAll(): Promise<Item[]> {
   const db = await open();
   return new Promise((res, rej) => {
     const r = db.transaction(STORE).objectStore(STORE).getAll();
-    r.onsuccess = () => res((r.result as Item[]).sort((a, b) => a.order - b.order));
+    r.onsuccess = () => {
+      const raw = (r.result as Record<string, unknown>[]) || [];
+      const items: Item[] = raw
+        .filter((it): it is Record<string, unknown> => it != null && typeof it === "object")
+        .map((it) => {
+          let source = it["source"] as Source | undefined;
+          if (!source || typeof source !== "object" || !source.type) {
+            if (it["audio"] instanceof Blob) {
+              source = {
+                type: "file",
+                blob: it["audio"] as Blob,
+                name: (typeof it["title"] === "string" ? it["title"] : "audio") || "audio",
+              };
+            } else {
+              source = {
+                type: "file",
+                blob: new Blob([]),
+                name: (typeof it["title"] === "string" ? it["title"] : "audio") || "audio",
+              };
+            }
+          }
+          const cover = it["cover"] instanceof Blob ? (it["cover"] as Blob) : new Blob([]);
+          const thumb =
+            it["thumb"] instanceof Blob
+              ? (it["thumb"] as Blob)
+              : cover.size > 0
+                ? cover
+                : new Blob([]);
+
+          return {
+            id: String(it["id"] || crypto.randomUUID()),
+            title: String(it["title"] || "Untitled"),
+            order:
+              typeof it["order"] === "number" && Number.isFinite(it["order"]) ? it["order"] : 0,
+            cover,
+            thumb,
+            source,
+          };
+        });
+      res(items.sort((a, b) => a.order - b.order));
+    };
     r.onerror = () => rej(r.error);
   });
 }
