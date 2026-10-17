@@ -108,19 +108,12 @@ function Gallery() {
         engine.state.status === "idle" ||
         engine.state.status === "error"
       ) {
-        youtubeEngine.stop();
+        youtubeEngine.destroy();
         engine.setMetadata({ title: it.title, coverBlob: it.cover });
         void engine.start(it.id, it.source.blob);
       }
     } else if (it.source?.type === "youtube") {
-      if (
-        ytState.videoId !== it.source.videoId ||
-        ytState.status === "idle" ||
-        ytState.status === "error"
-      ) {
-        engine.stop();
-        void youtubeEngine.load(it.source.videoId, it.title, it.cover);
-      }
+      engine.stop();
     }
     setOpen(it);
   };
@@ -154,7 +147,7 @@ function Gallery() {
       itemToDelete?.source?.type === "youtube" &&
       ytState.videoId === itemToDelete.source.videoId
     ) {
-      youtubeEngine.stop();
+      youtubeEngine.destroy();
     }
     try {
       await removeItem(id);
@@ -201,29 +194,18 @@ function Gallery() {
     setMode((cur) => (cur === m ? "view" : m));
   };
 
-  // Find if either local audio or YouTube audio is currently active in the background
+  // Find if local audio is currently active in the background
   const activePlayingItem =
     !open &&
     items?.find((i) => {
       if (!i) return false;
-      if (
+      return (
         i.id === engineState.itemId &&
         (engineState.status === "playing" || engineState.status === "paused")
-      ) {
-        return true;
-      }
-      if (
-        i.source?.type === "youtube" &&
-        i.source.videoId === ytState.videoId &&
-        (ytState.status === "playing" || ytState.status === "paused")
-      ) {
-        return true;
-      }
-      return false;
+      );
     });
 
-  const activeStatus =
-    activePlayingItem?.source?.type === "youtube" ? ytState.status : engineState.status;
+  const activeStatus = engineState.status;
 
   return (
     <main className="min-h-dvh pb-20">
@@ -438,11 +420,7 @@ function Gallery() {
               <button
                 onClick={(e) => {
                   e.stopPropagation();
-                  if (activePlayingItem?.source?.type === "youtube") {
-                    youtubeEngine.stop();
-                  } else {
-                    engine?.stop();
-                  }
+                  engine?.stop();
                 }}
                 className="glass-btn size-8 rounded-full p-1 text-on-scrim hover:bg-white/20"
                 aria-label="Stop sound and reset to beginning"
@@ -453,11 +431,7 @@ function Gallery() {
               <button
                 onClick={(e) => {
                   e.stopPropagation();
-                  if (activePlayingItem?.source?.type === "youtube") {
-                    youtubeEngine.toggle();
-                  } else {
-                    void engine?.toggle();
-                  }
+                  void engine?.toggle();
                 }}
                 className="glass-btn size-8 rounded-full p-1 text-on-scrim hover:bg-white/20"
                 aria-label={activeStatus === "playing" ? "Pause" : "Play"}

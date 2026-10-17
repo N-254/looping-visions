@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { ChevronDown, Loader2, Moon, Pause, Play, Square } from "lucide-react";
+import { ChevronDown, Loader2, Pause, Play, Square } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { isDismissSwipe, type SwipePoint } from "@/lib/player-gesture";
 import type { Item } from "@/lib/db";
@@ -11,7 +11,6 @@ type UI = { status: EngineState["status"] | YouTubeState["status"]; error?: stri
 export function Player({ item, onClose }: { item: Item; onClose: () => void }) {
   const [cover, setCover] = useState("");
   const [showControls, setShowControls] = useState(true);
-  const [sleepScreen, setSleepScreen] = useState(false);
   const isYt = item.source?.type === "youtube";
 
   const [ui, setUi] = useState<UI>(() => {
@@ -39,7 +38,6 @@ export function Player({ item, onClose }: { item: Item; onClose: () => void }) {
   const ytHost = useRef<HTMLDivElement>(null);
   const dialog = useRef<HTMLDivElement>(null);
   const gesture = useRef<(SwipePoint & { id: number }) | null>(null);
-  const wakeLock = useRef<WakeLockSentinel | null>(null);
 
   useEffect(() => {
     const previous = document.activeElement;
@@ -48,7 +46,6 @@ export function Player({ item, onClose }: { item: Item; onClose: () => void }) {
     document.body.style.overflow = "hidden";
     return () => {
       document.body.style.overflow = overflow;
-      // Do NOT stop audio on unmount: background playback continues
       if (previous instanceof HTMLElement) previous.focus();
     };
   }, []);
@@ -80,54 +77,28 @@ export function Player({ item, onClose }: { item: Item; onClose: () => void }) {
     });
   }, [isYt, item.id]);
 
-  // YouTube background & screen-off playback
+  // YouTube player mount and lifecycle
   useEffect(() => {
     if (item.source?.type !== "youtube") return;
     const { videoId } = item.source;
 
-    // Load or attach persistent YouTube engine
-    void youtubeEngine.load(videoId, item.title, item.cover);
+    let active = true;
     if (ytHost.current) {
-      youtubeEngine.attachTo(ytHost.current);
+      void youtubeEngine.mount(ytHost.current, videoId, item.title);
     }
 
     const unsub = youtubeEngine.subscribe((s) => {
-      setUi({ status: s.status, error: s.error });
+      if (active) {
+        setUi({ status: s.status, error: s.error });
+      }
     });
 
     return () => {
+      active = false;
       unsub();
-      // Keep YouTube playing in persistent container when player is dismissed
-      youtubeEngine.detachToPersistent();
+      youtubeEngine.destroy();
     };
   }, [item]);
-
-  // Screen Wake Lock when AMOLED sleep screen mode is active
-  useEffect(() => {
-    if (sleepScreen) {
-      if ("wakeLock" in navigator && typeof navigator.wakeLock.request === "function") {
-        navigator.wakeLock.request("screen").then(
-          (wl) => {
-            wakeLock.current = wl;
-          },
-          () => {
-            /* ignore unsupported */
-          },
-        );
-      }
-    } else {
-      if (wakeLock.current) {
-        wakeLock.current.release().catch(() => {});
-        wakeLock.current = null;
-      }
-    }
-    return () => {
-      if (wakeLock.current) {
-        wakeLock.current.release().catch(() => {});
-        wakeLock.current = null;
-      }
-    };
-  }, [sleepScreen]);
 
   const play = () => {
     if (isYt) {
@@ -162,7 +133,6 @@ export function Player({ item, onClose }: { item: Item; onClose: () => void }) {
 
   const close = () => {
     gesture.current = null;
-    // Closing player returns to gallery: playback continues in the background!
     onClose();
   };
 
@@ -183,10 +153,6 @@ export function Player({ item, onClose }: { item: Item; onClose: () => void }) {
 
   useEffect(() => {
     const k = (e: KeyboardEvent) => {
-      if (sleepScreen) {
-        setSleepScreen(false);
-        return;
-      }
       if (e.key === "Escape") close();
       if (e.key === " ") {
         if (
@@ -281,7 +247,7 @@ export function Player({ item, onClose }: { item: Item; onClose: () => void }) {
         }`}
       />
 
-      {/* Top bar: Dismiss button, title, and Screen-off mode toggle */}
+      {/* Top bar: Dismiss button and title */}
       <div
         className={`safe-top absolute inset-x-0 top-0 flex items-center justify-between px-3 pt-3 transition-opacity duration-300 ${
           showControls ? "pointer-events-auto opacity-100" : "pointer-events-none opacity-0"
@@ -292,23 +258,16 @@ export function Player({ item, onClose }: { item: Item; onClose: () => void }) {
           onClick={close}
           className="glass-btn flex size-10 items-center justify-center rounded-full text-on-scrim shadow-md backdrop-blur-md hover:bg-white/20 active:scale-95"
           aria-label="Close player and return to gallery"
-          title="Return to gallery (audio continues in background)"
+          title="Return to gallery"
         >
           <ChevronDown className="size-5" />
         </button>
 
-        <h1 className="glass-btn max-w-[65vw] truncate px-3 py-1.5 text-xs font-medium tracking-wide text-on-scrim shadow-lg backdrop-blur-md sm:max-w-[75vw] sm:text-sm">
+        <h1 className="glass-btn max-w-[70vw] truncate px-3 py-1.5 text-xs font-medium tracking-wide text-on-scrim shadow-lg backdrop-blur-md sm:max-w-[80vw] sm:text-sm">
           {item.title}
         </h1>
 
-        <button
-          onClick={() => setSleepScreen(true)}
-          className="glass-btn flex size-10 items-center justify-center rounded-full text-on-scrim shadow-md backdrop-blur-md hover:bg-white/20 active:scale-95"
-          aria-label="Turn off screen (AMOLED sleep mode)"
-          title="Screen-off sleep mode: black display with background audio"
-        >
-          <Moon className="size-4" />
-        </button>
+        <div className="size-10" aria-hidden="true" />
       </div>
 
       {/* Bottom controls: Stop button (resets to beginning) & Play/Pause */}
@@ -331,7 +290,7 @@ export function Player({ item, onClose }: { item: Item; onClose: () => void }) {
           <div
             ref={ytHost}
             data-player-control
-            className="aspect-video w-60 touch-auto overflow-hidden rounded-xl bg-scrim shadow-xl"
+            className="aspect-video w-72 max-w-[85vw] touch-auto overflow-hidden rounded-xl bg-black/60 shadow-2xl sm:w-80"
           />
         )}
 
@@ -369,25 +328,6 @@ export function Player({ item, onClose }: { item: Item; onClose: () => void }) {
           </Button>
         </div>
       </div>
-
-      {/* AMOLED Screen-off / Sleep mode overlay: pure black, keeps playback running with 0% screen glare */}
-      {sleepScreen && (
-        <div
-          role="button"
-          tabIndex={0}
-          aria-label="Screen off sleep mode active. Tap anywhere to wake."
-          onClick={() => setSleepScreen(false)}
-          onKeyDown={(e) => e.key === "Escape" && setSleepScreen(false)}
-          className="fixed inset-0 z-50 flex cursor-pointer select-none flex-col items-center justify-center bg-black text-center"
-        >
-          <div className="flex flex-col items-center gap-3 opacity-30 transition-opacity hover:opacity-70">
-            <Moon className="size-7 animate-pulse text-white" />
-            <p className="text-xs tracking-wider text-white/70">
-              Screen Off Mode · Tap anywhere to wake
-            </p>
-          </div>
-        </div>
-      )}
     </div>
   );
 }

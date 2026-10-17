@@ -159,6 +159,56 @@ class NativeBufferLooper {
 
 type StreamVoice = { el: HTMLAudioElement; node: MediaElementAudioSourceNode; g: GainNode };
 
+/**
+ * Creates an optimized 512x512 square data URL for MediaSession notification artwork.
+ * Using a self-contained data URL ensures Android SystemUI / NotificationCompat
+ * receives the exact album artwork across processes without blob-revocation race conditions.
+ */
+export async function createMediaSessionArtworkUrl(blob: Blob): Promise<string> {
+  if (typeof document !== "undefined" && typeof createImageBitmap === "function") {
+    try {
+      const bmp = await createImageBitmap(blob);
+      const canvas = document.createElement("canvas");
+      const size = 512;
+      canvas.width = size;
+      canvas.height = size;
+      const ctx = canvas.getContext("2d");
+      if (ctx) {
+        // Center crop to square
+        const minSide = Math.min(bmp.width, bmp.height);
+        const sx = (bmp.width - minSide) / 2;
+        const sy = (bmp.height - minSide) / 2;
+        ctx.drawImage(bmp, sx, sy, minSide, minSide, 0, 0, size, size);
+        bmp.close();
+        return canvas.toDataURL("image/jpeg", 0.85);
+      }
+      bmp.close();
+    } catch {
+      /* fallback below */
+    }
+  }
+
+  return new Promise<string>((resolve) => {
+    if (typeof FileReader === "undefined") {
+      resolve(
+        typeof URL !== "undefined" && typeof URL.createObjectURL === "function"
+          ? URL.createObjectURL(blob)
+          : "",
+      );
+      return;
+    }
+    const reader = new FileReader();
+    reader.onload = () => resolve(reader.result as string);
+    reader.onerror = () =>
+      resolve(
+        typeof URL !== "undefined" && typeof URL.createObjectURL === "function"
+          ? URL.createObjectURL(blob)
+          : "",
+      );
+    reader.readAsDataURL(blob);
+  });
+}
+
 export class Engine {
   state: EngineState = { status: "idle", itemId: null };
   private listeners = new Set<(s: EngineState) => void>();
@@ -183,6 +233,7 @@ export class Engine {
   // MediaSession metadata
   private metadata?: EngineMetadata;
   private mediaSessionCoverUrl?: string;
+  private lastCoverBlob?: Blob;
 
   constructor() {
     if (typeof document !== "undefined") {
@@ -230,23 +281,61 @@ export class Engine {
     this.metadata = meta;
     if (typeof navigator === "undefined" || !navigator.mediaSession) return;
     const ms = navigator.mediaSession;
+    const title = meta.title || "Dreamer";
+    const mimeType = meta.coverBlob?.type || "image/jpeg";
 
-    if (this.mediaSessionCoverUrl) {
-      URL.revokeObjectURL(this.mediaSessionCoverUrl);
-      this.mediaSessionCoverUrl = undefined;
-    }
+    const updateArtwork = (src: string, type: string) => {
+      if (typeof MediaMetadata === "undefined") return;
+      const sizes = ["96x96", "128x128", "192x192", "256x256", "384x384", "512x512"];
+      ms.metadata = new MediaMetadata({
+        title,
+        artwork: sizes.map((size) => ({
+          src,
+          sizes: size,
+          type,
+        })),
+      });
+    };
 
     if (meta.coverBlob) {
-      this.mediaSessionCoverUrl = URL.createObjectURL(meta.coverBlob);
-    }
+      if (!this.mediaSessionCoverUrl || this.lastCoverBlob !== meta.coverBlob) {
+        if (this.mediaSessionCoverUrl && this.mediaSessionCoverUrl.startsWith("blob:")) {
+          try {
+            URL.revokeObjectURL(this.mediaSessionCoverUrl);
+          } catch {
+            /* ignore */
+          }
+        }
+        this.lastCoverBlob = meta.coverBlob;
+        try {
+          this.mediaSessionCoverUrl = URL.createObjectURL(meta.coverBlob);
+        } catch {
+          this.mediaSessionCoverUrl = undefined;
+        }
+      }
 
-    if (typeof MediaMetadata !== "undefined") {
-      ms.metadata = new MediaMetadata({
-        title: meta.title || "Dreamer",
-        artwork: this.mediaSessionCoverUrl
-          ? [{ src: this.mediaSessionCoverUrl, sizes: "512x512", type: "image/png" }]
-          : [],
+      if (this.mediaSessionCoverUrl) {
+        updateArtwork(this.mediaSessionCoverUrl, mimeType);
+      }
+
+      const blob = meta.coverBlob;
+      void createMediaSessionArtworkUrl(blob).then((dataUrl) => {
+        if (
+          this.lastCoverBlob === blob &&
+          typeof navigator !== "undefined" &&
+          navigator.mediaSession
+        ) {
+          this.mediaSessionCoverUrl = dataUrl;
+          updateArtwork(dataUrl, "image/jpeg");
+        }
       });
+    } else {
+      if (typeof MediaMetadata !== "undefined") {
+        ms.metadata = new MediaMetadata({
+          title,
+          artwork: [],
+        });
+      }
     }
 
     ms.setActionHandler("play", () => void this.resume());
@@ -585,10 +674,15 @@ export class Engine {
     this.out?.pause();
     void this.ctx?.suspend().catch(() => {});
 
-    if (this.mediaSessionCoverUrl) {
-      URL.revokeObjectURL(this.mediaSessionCoverUrl);
-      this.mediaSessionCoverUrl = undefined;
+    if (this.mediaSessionCoverUrl && this.mediaSessionCoverUrl.startsWith("blob:")) {
+      try {
+        URL.revokeObjectURL(this.mediaSessionCoverUrl);
+      } catch {
+        /* ignore */
+      }
     }
+    this.mediaSessionCoverUrl = undefined;
+    this.lastCoverBlob = undefined;
     if (typeof navigator !== "undefined" && navigator.mediaSession) {
       navigator.mediaSession.metadata = null;
       navigator.mediaSession.playbackState = "none";

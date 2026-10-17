@@ -46,21 +46,30 @@ declare global {
 
 let apiP: Promise<NonNullable<Window["YT"]>> | null = null;
 export function loadYouTubeApi() {
+  if (typeof window === "undefined") {
+    return Promise.reject(new Error("YouTube API requires a browser environment"));
+  }
+  if (window.YT?.Player) {
+    return Promise.resolve(window.YT);
+  }
   if (!apiP) {
     apiP = new Promise((res, rej) => {
       if (window.YT?.Player) return res(window.YT);
       const prev = window.onYouTubeIframeAPIReady;
       window.onYouTubeIframeAPIReady = () => {
         prev?.();
-        res(window.YT!);
+        if (window.YT) res(window.YT);
       };
-      const s = document.createElement("script");
-      s.src = "https://www.youtube.com/iframe_api";
-      s.onerror = () => {
-        apiP = null;
-        rej(new Error("YouTube unavailable. Check connection."));
-      };
-      document.head.appendChild(s);
+      const existing = document.querySelector('script[src="https://www.youtube.com/iframe_api"]');
+      if (!existing) {
+        const s = document.createElement("script");
+        s.src = "https://www.youtube.com/iframe_api";
+        s.onerror = () => {
+          apiP = null;
+          rej(new Error("YouTube unavailable. Check connection."));
+        };
+        document.head.appendChild(s);
+      }
     });
   }
   return apiP;
