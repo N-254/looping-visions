@@ -40,23 +40,19 @@ export function canDecode(size: number, duration: number, sampleRate: number): b
   );
 }
 
-// Pre-computed 128-point quarter-sine / quarter-cosine curves for equal-power crossfading
-// Equal power property: UP[i]^2 + DOWN[i]^2 = sin^2(x) + cos^2(x) = 1.0 (constant acoustic power)
-const UP = Float32Array.from({ length: 128 }, (_, i) => Math.sin(((i / 127) * Math.PI) / 2));
-const DOWN = Float32Array.from({ length: 128 }, (_, i) => Math.cos(((i / 127) * Math.PI) / 2));
-
 /**
  * Pre-renders an overlapping crossfade buffer once:
- * The tail (cycleDuration to duration) is crossfaded with equal-power curves into the head (0 to crossfade).
- * Native looping of this buffer is continuous and hardware-driven, avoiding periodic buffer scheduling
- * and eliminating background audio dropouts when tabs or mobile devices sleep.
+ * Renders the audio buffer preserving standard song progression, with smooth fade
+ * applied only at the beginning and end of each sound cycle.
+ * Native looping of this buffer is continuous, hardware-clock driven, and avoids any
+ * unnatural overlapping or echo effects.
  */
 export function renderLoopBuffer(ctx: AudioContext, buffer: AudioBuffer): AudioBuffer {
   const duration = buffer.duration;
-  const crossfade = crossfadeFor(duration);
+  const fade = crossfadeFor(duration);
   if (
-    crossfade <= 0 ||
-    duration <= crossfade ||
+    fade <= 0 ||
+    duration <= fade ||
     typeof buffer.getChannelData !== "function" ||
     typeof ctx.createBuffer !== "function"
   ) {
@@ -65,26 +61,25 @@ export function renderLoopBuffer(ctx: AudioContext, buffer: AudioBuffer): AudioB
 
   const sr = buffer.sampleRate || 48000;
   const numChannels = buffer.numberOfChannels || 1;
-  const cycleDuration = duration - crossfade;
-  const cycleFrames = Math.max(1, Math.round(cycleDuration * sr));
-  const crossfadeFrames = Math.max(1, Math.round(crossfade * sr));
+  const totalFrames = buffer.length;
+  const fadeFrames = Math.min(Math.round(fade * sr), Math.floor(totalFrames / 2));
 
   try {
-    const rendered = ctx.createBuffer(numChannels, cycleFrames, sr);
+    const rendered = ctx.createBuffer(numChannels, totalFrames, sr);
     for (let c = 0; c < numChannels; c++) {
       const src = buffer.getChannelData(c);
       const dst = rendered.getChannelData(c);
-      for (let i = 0; i < crossfadeFrames; i++) {
-        const theta = (Math.PI / 2) * (i / crossfadeFrames);
-        const wTail = Math.cos(theta);
-        const wHead = Math.sin(theta);
-        const tailIdx = i + cycleFrames;
-        const tailSample = tailIdx < src.length ? src[tailIdx]! : 0;
-        const headSample = i < src.length ? src[i]! : 0;
-        dst[i] = tailSample * wTail + headSample * wHead;
-      }
-      for (let i = crossfadeFrames; i < cycleFrames; i++) {
-        dst[i] = i < src.length ? src[i]! : 0;
+      for (let i = 0; i < totalFrames; i++) {
+        let gain = 1.0;
+        if (i < fadeFrames && fadeFrames > 0) {
+          // Smooth fade-in at the beginning
+          gain = Math.sin(((Math.PI / 2) * i) / fadeFrames);
+        } else if (i >= totalFrames - fadeFrames && fadeFrames > 0) {
+          // Smooth fade-out at the end
+          const remaining = totalFrames - 1 - i;
+          gain = Math.sin(((Math.PI / 2) * remaining) / fadeFrames);
+        }
+        dst[i] = (src[i] ?? 0) * gain;
       }
     }
     return rendered;
@@ -226,8 +221,6 @@ export class Engine {
   private els: StreamVoice[] = [];
   private elUrl?: string;
   private activeStreamVoice = 0;
-  private streamTransition?: { outgoing: StreamVoice; end: number };
-  private swapping = false;
   private cancelLoad?: () => void;
 
   // MediaSession metadata
@@ -362,9 +355,10 @@ export class Engine {
     this.master = ctx.createGain();
     this.fader = ctx.createGain();
     this.fader.connect(this.master);
-    this.master.connect(ctx.destination);
 
-    // Audio carrier element / MediaStream destination for mobile background playback continuity
+    // Single output routing: Route through MediaStream destination when available to power MediaSession,
+    // otherwise fallback to ctx.destination. Never connect to both simultaneously to prevent echo!
+    let connectedToStream = false;
     if (typeof Audio !== "undefined") {
       try {
         if (
@@ -383,24 +377,15 @@ export class Engine {
           this.out = new Audio();
           this.out.srcObject = dest.stream;
           this.out.volume = 1;
-        } else {
-          const SILENT_WAV =
-            "data:audio/wav;base64,UklGRigAAABXQVZFZm10IBIAAAABAAEARKwAAIhYAQACABAAAABkYXRhAgAAAAEA";
-          this.out = new Audio(SILENT_WAV);
-          this.out.loop = true;
-          this.out.volume = 0.01;
+          connectedToStream = true;
         }
       } catch {
-        try {
-          const SILENT_WAV =
-            "data:audio/wav;base64,UklGRigAAABXQVZFZm10IBIAAAABAAEARKwAAIhYAQACABAAAABkYXRhAgAAAAEA";
-          this.out = new Audio(SILENT_WAV);
-          this.out.loop = true;
-          this.out.volume = 0.01;
-        } catch {
-          /* ignore */
-        }
+        /* fallback to ctx.destination below */
       }
+    }
+
+    if (!connectedToStream) {
+      this.master.connect(ctx.destination);
     }
 
     this.ctx = ctx;
@@ -527,58 +512,33 @@ export class Engine {
   private tickStream() {
     const ctx = this.ctx;
     if (!ctx || this.state.status !== "playing") return;
-    if (this.streamTransition) {
-      if (ctx.currentTime < this.streamTransition.end) return;
-      this.streamTransition.outgoing.el.pause();
-      this.streamTransition.outgoing.el.currentTime = 0;
-      this.streamTransition = undefined;
-    }
     const cur = this.els[this.activeStreamVoice];
-    if (!cur || this.swapping) return;
-    if (cur.el.ended || cur.el.currentTime >= cur.el.duration - crossfadeFor(cur.el.duration)) {
-      void this.swapStream();
+    if (!cur) return;
+
+    const dur = cur.el.duration;
+    const fade = crossfadeFor(dur);
+
+    if (fade > 0 && dur > fade) {
+      if (cur.el.currentTime < fade) {
+        // Smooth fade-in at the beginning
+        const gain = Math.sin(((Math.PI / 2) * cur.el.currentTime) / fade);
+        cur.g.gain.cancelScheduledValues(ctx.currentTime);
+        cur.g.gain.setValueAtTime(gain, ctx.currentTime);
+      } else if (cur.el.currentTime >= dur - fade) {
+        // Smooth fade-out at the end
+        const remain = Math.max(0, dur - cur.el.currentTime);
+        const gain = Math.sin(((Math.PI / 2) * remain) / fade);
+        cur.g.gain.cancelScheduledValues(ctx.currentTime);
+        cur.g.gain.setValueAtTime(gain, ctx.currentTime);
+      } else {
+        cur.g.gain.cancelScheduledValues(ctx.currentTime);
+        cur.g.gain.setValueAtTime(1, ctx.currentTime);
+      }
     }
-  }
 
-  private async swapStream() {
-    const ctx = this.ctx;
-    const cur = this.els[this.activeStreamVoice];
-    const nxt = this.els[1 - this.activeStreamVoice];
-    if (!ctx || !cur || !nxt || this.swapping) return;
-
-    const token = this.token;
-    this.swapping = true;
-    try {
-      nxt.el.currentTime = 0;
-      await nxt.el.play();
-      if (token !== this.token) {
-        nxt.el.pause();
-        return;
-      }
-      const t = ctx.currentTime;
-      const x = Math.max(
-        0.01,
-        Math.min(crossfadeFor(cur.el.duration), cur.el.duration - cur.el.currentTime),
-      );
-      nxt.g.gain.cancelScheduledValues(t);
-      nxt.g.gain.setValueAtTime(0, t);
-      nxt.g.gain.setValueCurveAtTime(UP, t, x);
-
-      cur.g.gain.cancelScheduledValues(t);
-      cur.g.gain.setValueAtTime(1, t);
-      cur.g.gain.setValueCurveAtTime(DOWN, t, x);
-
-      this.activeStreamVoice = 1 - this.activeStreamVoice;
-      this.streamTransition = { outgoing: cur, end: t + x };
-      if (this.state.status !== "playing") nxt.el.pause();
-    } catch {
-      if (token === this.token) {
-        this.set({ status: "error", error: "Playback interrupted. Tap play to retry." });
-        this.teardown();
-        this.out?.pause();
-      }
-    } finally {
-      if (token === this.token) this.swapping = false;
+    if (cur.el.ended || cur.el.currentTime >= cur.el.duration - 0.05) {
+      cur.el.currentTime = 0;
+      void cur.el.play().catch(() => {});
     }
   }
 
@@ -634,13 +594,13 @@ export class Engine {
         );
         this.looper.start();
       } else {
-        const voices = this.streamTransition
-          ? [this.els[this.activeStreamVoice], this.streamTransition.outgoing]
-          : [this.els[this.activeStreamVoice]];
-        await Promise.all(voices.map((v) => v?.el.play()));
-        if (token !== this.token) {
-          voices.forEach((v) => v?.el.pause());
-          return;
+        const voice = this.els[this.activeStreamVoice];
+        if (voice) {
+          await voice.el.play();
+          if (token !== this.token) {
+            voice.el.pause();
+            return;
+          }
         }
       }
 
@@ -718,8 +678,6 @@ export class Engine {
     }
     this.buffer = undefined;
     this.releaseElements();
-    this.streamTransition = undefined;
-    this.swapping = false;
     this.activeStreamVoice = 0;
   }
 

@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { canDecode, crossfadeFor, Engine, CROSSFADE } from "@/lib/audio-engine";
+import { canDecode, crossfadeFor, Engine, CROSSFADE, renderLoopBuffer } from "@/lib/audio-engine";
 
 describe("bounded audio decoding", () => {
   it("decodes a safe short file", () => expect(canDecode(100000, 6, 48000)).toBe(true));
@@ -139,5 +139,49 @@ describe("playback lifecycle and state synchronization", () => {
     expect(mockMediaSession.setActionHandler).toHaveBeenCalledWith("play", expect.any(Function));
     expect(mockMediaSession.setActionHandler).toHaveBeenCalledWith("pause", expect.any(Function));
     expect(mockMediaSession.setActionHandler).toHaveBeenCalledWith("stop", expect.any(Function));
+  });
+});
+
+describe("renderLoopBuffer", () => {
+  it("preserves total song length and applies fade effect only at the beginning and end", () => {
+    const numSamples = 1000;
+    const sampleRate = 100;
+    const channels = 1;
+    const data = new Float32Array(numSamples).fill(1.0);
+    const mockBuffer = {
+      duration: 10,
+      length: numSamples,
+      sampleRate,
+      numberOfChannels: channels,
+      getChannelData: () => data,
+    } as unknown as AudioBuffer;
+
+    const mockCtx = {
+      createBuffer: (_c: number, len: number, sr: number) => {
+        const out = new Float32Array(len);
+        return {
+          duration: len / sr,
+          length: len,
+          sampleRate: sr,
+          numberOfChannels: 1,
+          getChannelData: () => out,
+        };
+      },
+    } as unknown as AudioContext;
+
+    const rendered = renderLoopBuffer(mockCtx, mockBuffer);
+    expect(rendered.length).toBe(mockBuffer.length);
+
+    const outData = rendered.getChannelData(0);
+    // Beginning: smooth fade-in starting at 0
+    expect(outData[0]).toBeCloseTo(0, 2);
+    expect(outData[50]).toBeGreaterThan(outData[0]);
+
+    // Middle: standard normal song playback (1.0 unmodified)
+    const mid = Math.floor(numSamples / 2);
+    expect(outData[mid]).toBeCloseTo(1.0, 2);
+
+    // End: smooth fade-out ending at 0
+    expect(outData[numSamples - 1]).toBeCloseTo(0, 2);
   });
 });
